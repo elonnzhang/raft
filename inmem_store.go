@@ -31,6 +31,8 @@ func NewInmemStore() *InmemStore {
 	return i
 }
 
+var _ LogStore = (*InmemStore)(nil)
+
 // FirstIndex implements the LogStore interface.
 func (i *InmemStore) FirstIndex() (uint64, error) {
 	i.l.RLock()
@@ -97,6 +99,8 @@ func (i *InmemStore) DeleteRange(min, max uint64) error {
 	}
 	return nil
 }
+
+var _ StableStore = (*InmemStore)(nil)
 
 // Set implements the StableStore interface.
 func (i *InmemStore) Set(key []byte, val []byte) error {

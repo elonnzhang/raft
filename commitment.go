@@ -74,11 +74,14 @@ func (c *commitment) getCommitIndex() uint64 {
 // leader has written the new entry or a follower has replied to an
 // AppendEntries RPC. The given server's disk agrees with this server's log up
 // through the given index.
+// 写磁盘后调用，
 func (c *commitment) match(server ServerID, matchIndex uint64) {
 	c.Lock()
 	defer c.Unlock()
+	// 如果传入的 server 已投票, 另外 index 大于上一个记录的 index, 则更新 matchIndex.
 	if prev, hasVote := c.matchIndexes[server]; hasVote && matchIndex > prev {
 		c.matchIndexes[server] = matchIndex
+		// 重新计算
 		c.recalculate()
 	}
 }
@@ -86,19 +89,24 @@ func (c *commitment) match(server ServerID, matchIndex uint64) {
 // Internal helper to calculate new commitIndex from matchIndexes.
 // Must be called with lock held.
 func (c *commitment) recalculate() {
+	// 需要重计算, 但还未初始化 matchIndex 数据时, 直接退出.
 	if len(c.matchIndexes) == 0 {
 		return
 	}
 
+	// 初始化 一个容器存放各个 server 的 index.
 	matched := make([]uint64, 0, len(c.matchIndexes))
 	for _, idx := range c.matchIndexes {
 		matched = append(matched, idx)
 	}
+	// 索引排序 （升序）
 	sort.Sort(uint64Slice(matched))
+	// 法定判断点位：大多数 [1,2,3, | 4,5]
+	// [1,1,1,2,2]
 	quorumMatchIndex := matched[(len(matched)-1)/2]
-
+	// 如果法定判断位大于当前的提交点, 并且法定点大于 first index, 则更新 commitIndex 和通知 commitCh.
 	if quorumMatchIndex > c.commitIndex && quorumMatchIndex >= c.startIndex {
-		c.commitIndex = quorumMatchIndex
-		asyncNotifyCh(c.commitCh)
+		c.commitIndex = quorumMatchIndex // 更新提交点位
+		asyncNotifyCh(c.commitCh)        // 通知提交信号，Leader 处理
 	}
 }

@@ -20,22 +20,24 @@ import (
 // Note: the caller must be single-threaded and saturationMetric is not safe for
 // concurrent use by multiple goroutines.
 type saturationMetric struct {
-	reportInterval time.Duration
+	reportInterval time.Duration // 上报的时间间隔。
 
 	// slept contains time for which the event processing loop was sleeping rather
 	// than working in the period since lastReport.
+	// 记录事件处理循环在最近一次报告以来的空闲时间（即没有任务时的等待时间总和）
 	slept time.Duration
 
 	// lost contains time that is considered lost due to incorrect use of
 	// saturationMetricBucket (e.g. calling sleeping() or working() multiple
 	// times in succession) in the period since lastReport.
+	// 记录由于调用顺序不正确（例如连续调用 sleeping() 或 working()）而导致的时间损失。
 	lost time.Duration
-
+	// 	上一次报告饱和度的时间, 记录最近一次进入等待状态（sleeping）的时间, 记录最近一次进入工作状态（working）的时间。
 	lastReport, sleepBegan, workBegan time.Time
 
 	// These are overwritten in tests.
-	nowFn    func() time.Time
-	reportFn func(float32)
+	nowFn    func() time.Time // 用于获取当前时间的函数。默认情况下是 time.Now()，但在测试中可以用其他实现替代，以便模拟时间或控制测试流程。
+	reportFn func(float32)    //用于报告饱和度的函数。可以在测试中替换为模拟函数，用来检查报告逻辑是否正确。
 }
 
 // newSaturationMetric creates a saturationMetric that will update the gauge
@@ -46,7 +48,7 @@ func newSaturationMetric(name []string, reportInterval time.Duration) *saturatio
 		reportInterval: reportInterval,
 		nowFn:          time.Now,
 		lastReport:     time.Now(),
-		reportFn:       func(sat float32) { metrics.AddSample(name, sat) },
+		reportFn:       func(sat float32) { metrics.AddSample(name, sat) }, // 上报名 name 上报指标 sat
 	}
 	return m
 }
@@ -92,6 +94,7 @@ func (s *saturationMetric) working() {
 }
 
 // report updates the gauge if reportInterval has passed since our last report.
+// 被 working 和 sleeping 调用
 func (s *saturationMetric) report() {
 	now := s.nowFn()
 	timeSinceLastReport := now.Sub(s.lastReport)

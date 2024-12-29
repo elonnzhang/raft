@@ -86,9 +86,10 @@ type FSMSnapshot interface {
 func (r *Raft) runFSM() {
 	var lastIndex, lastTerm uint64
 
-	batchingFSM, batchingEnabled := r.fsm.(BatchingFSM)
-	configStore, configStoreEnabled := r.fsm.(ConfigurationStore)
+	batchingFSM, batchingEnabled := r.fsm.(BatchingFSM)           // 如果有批量的实现
+	configStore, configStoreEnabled := r.fsm.(ConfigurationStore) // 如果有配置持久化的实现
 
+	// 单次提交
 	applySingle := func(req *commitTuple) {
 		// Apply the log if a command or config change
 		var resp interface{}
@@ -101,10 +102,11 @@ func (r *Raft) runFSM() {
 			}
 		}()
 
+		// 仅处理两种类型
 		switch req.log.Type {
 		case LogCommand:
 			start := time.Now()
-			resp = r.fsm.Apply(req.log)
+			resp = r.fsm.Apply(req.log) // 状态应用
 			metrics.MeasureSince([]string{"raft", "fsm", "apply"}, start)
 
 		case LogConfiguration:
@@ -124,7 +126,9 @@ func (r *Raft) runFSM() {
 		lastTerm = req.log.Term
 	}
 
+	// 批量提交
 	applyBatch := func(reqs []*commitTuple) {
+		// 无批量实现，遍历单次请求
 		if !batchingEnabled {
 			for _, ct := range reqs {
 				applySingle(ct)
@@ -134,14 +138,17 @@ func (r *Raft) runFSM() {
 
 		// Only send LogCommand and LogConfiguration log types. LogBarrier types
 		// will not be sent to the FSM.
+		// 是否需要发送到有限状态机
 		shouldSend := func(l *Log) bool {
 			switch l.Type {
+			// 用户指令、配置变更
 			case LogCommand, LogConfiguration:
 				return true
 			}
 			return false
 		}
 
+		// 上次状态
 		var lastBatchIndex, lastBatchTerm uint64
 		sendLogs := make([]*Log, 0, len(reqs))
 		for _, req := range reqs {
@@ -152,6 +159,7 @@ func (r *Raft) runFSM() {
 			lastBatchTerm = req.log.Term
 		}
 
+		// 发送 Log
 		var responses []interface{}
 		if len(sendLogs) > 0 {
 			start := time.Now()
@@ -159,6 +167,7 @@ func (r *Raft) runFSM() {
 			metrics.MeasureSince([]string{"raft", "fsm", "applyBatch"}, start)
 			metrics.AddSample([]string{"raft", "fsm", "applyBatchNum"}, float32(len(reqs)))
 
+			// 确保 发送与收到的响应数量一致
 			// Ensure we get the expected responses
 			if len(sendLogs) != len(responses) {
 				panic("invalid number of responses")
@@ -185,6 +194,7 @@ func (r *Raft) runFSM() {
 		}
 	}
 
+	// 恢复操作
 	restore := func(req *restoreFuture) {
 		// Open the snapshot
 		meta, source, err := r.snapshots.Open(req.ID)
@@ -213,6 +223,7 @@ func (r *Raft) runFSM() {
 		req.respond(nil)
 	}
 
+	// 快照
 	snapshot := func(req *reqSnapshotFuture) {
 		// Is there something to snapshot?
 		if lastIndex == 0 {
@@ -234,6 +245,7 @@ func (r *Raft) runFSM() {
 
 	saturation := newSaturationMetric([]string{"raft", "thread", "fsm", "saturation"}, 1*time.Second)
 
+	// 监听操作
 	for {
 		saturation.sleeping()
 

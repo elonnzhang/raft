@@ -19,6 +19,13 @@ type Future interface {
 	// Error will only return generic errors related to raft, such
 	// as ErrLeadershipLost, or ErrRaftShutdown. Some operations, such as
 	// ApplyLog, may also return errors from other methods.
+	//
+	// Error 会阻塞直到未来完成，并返回 Future 的错误状态。
+	// 此方法可以被调用多次 —— 所有调用都会返回相同的值。
+	// 然而，不允许在同一个 Future 实例上同时并发调用此方法两次。
+	//
+	// Error 仅会返回与 Raft 相关的一些通用错误，例如 ErrLeadershipLost 或
+	// ErrRaftShutdown。一些操作（例如 ApplyLog）也可能返回其他方法产生的错误。
 	Error() error
 }
 
@@ -71,6 +78,7 @@ type LeadershipTransferFuture interface {
 }
 
 // errorFuture is used to return a static error.
+// 返回一个静态错误，简单的包装 error
 type errorFuture struct {
 	err error
 }
@@ -89,11 +97,12 @@ func (e errorFuture) Index() uint64 {
 
 // deferError can be embedded to allow a future
 // to provide an error in the future.
+// 可以内嵌的延迟处理错误
 type deferError struct {
-	err        error
-	errCh      chan error
-	responded  bool
-	ShutdownCh chan struct{}
+	err        error         //错误
+	errCh      chan error    // 错误通道
+	responded  bool          // 是否响应过了
+	ShutdownCh chan struct{} // 关闭信号通道
 }
 
 func (d *deferError) init() {
@@ -101,23 +110,31 @@ func (d *deferError) init() {
 }
 
 func (d *deferError) Error() error {
+	// err 不为空，则直接返回错误
 	if d.err != nil {
 		// Note that when we've received a nil error, this
 		// won't trigger, but the channel is closed after
 		// send so we'll still return nil below.
 		return d.err
 	}
+	// err chan 如果为空，panic，所以必须初始化 init
 	if d.errCh == nil {
 		panic("waiting for response on nil channel")
 	}
+	// 监听 err
 	select {
+	// 将 errCh 通道的 err 取出 给 err
 	case d.err = <-d.errCh:
+	// 关闭错误
 	case <-d.ShutdownCh:
 		d.err = ErrRaftShutdown
 	}
+	// final return
 	return d.err
 }
 
+// respond 响应错误
+// 将 err 发送给 errCh，并标记为已响应
 func (d *deferError) respond(err error) {
 	if d.errCh == nil {
 		return
@@ -133,6 +150,7 @@ func (d *deferError) respond(err error) {
 // There are several types of requests that cause a configuration entry to
 // be appended to the log. These are encoded here for leaderLoop() to process.
 // This is internal to a single server.
+// 配置变更
 type configurationChangeFuture struct {
 	logFuture
 	req configurationChangeRequest
@@ -140,6 +158,7 @@ type configurationChangeFuture struct {
 
 // bootstrapFuture is used to attempt a live bootstrap of the cluster. See the
 // Raft object's BootstrapCluster member function for more details.
+// 启动
 type bootstrapFuture struct {
 	deferError
 
@@ -156,6 +175,8 @@ type logFuture struct {
 	dispatch time.Time
 }
 
+var _ ApplyFuture = (*logFuture)(nil)
+
 func (l *logFuture) Response() interface{} {
 	return l.response
 }
@@ -167,6 +188,8 @@ func (l *logFuture) Index() uint64 {
 type shutdownFuture struct {
 	raft *Raft
 }
+
+var _ Future = (*shutdownFuture)(nil)
 
 func (s *shutdownFuture) Error() error {
 	if s.raft == nil {
@@ -189,6 +212,8 @@ type userSnapshotFuture struct {
 	opener func() (*SnapshotMeta, io.ReadCloser, error)
 }
 
+var _ SnapshotFuture = (*userSnapshotFuture)(nil)
+
 // Open is a function you can call to access the underlying snapshot and its
 // metadata.
 func (u *userSnapshotFuture) Open() (*SnapshotMeta, io.ReadCloser, error) {
@@ -198,6 +223,7 @@ func (u *userSnapshotFuture) Open() (*SnapshotMeta, io.ReadCloser, error) {
 	// Invalidate the opener so it can't get called multiple times,
 	// which isn't generally safe.
 	defer func() {
+		// 内存回收，不能被多次调用了
 		u.opener = nil
 	}()
 	return u.opener()
@@ -233,16 +259,6 @@ type restoreFuture struct {
 	ID string
 }
 
-// verifyFuture is used to verify the current node is still
-// the leader. This is to prevent a stale read.
-type verifyFuture struct {
-	deferError
-	notifyCh   chan *verifyFuture
-	quorumSize int
-	votes      int
-	voteLock   sync.Mutex
-}
-
 // leadershipTransferFuture is used to track the progress of a leadership
 // transfer internally.
 type leadershipTransferFuture struct {
@@ -259,6 +275,8 @@ type configurationsFuture struct {
 	configurations configurations
 }
 
+var _ ConfigurationFuture = (*configurationsFuture)(nil)
+
 // Configuration returns the latest configuration in use by Raft.
 func (c *configurationsFuture) Configuration() Configuration {
 	return c.configurations.latest
@@ -267,6 +285,16 @@ func (c *configurationsFuture) Configuration() Configuration {
 // Index returns the index of the latest configuration in use by Raft.
 func (c *configurationsFuture) Index() uint64 {
 	return c.configurations.latestIndex
+}
+
+// verifyFuture is used to verify the current node is still
+// the leader. This is to prevent a stale read.
+type verifyFuture struct {
+	deferError
+	notifyCh   chan *verifyFuture
+	quorumSize int
+	votes      int
+	voteLock   sync.Mutex
 }
 
 // vote is used to respond to a verifyFuture.
@@ -300,6 +328,8 @@ type appendFuture struct {
 	args  *AppendEntriesRequest
 	resp  *AppendEntriesResponse
 }
+
+var _ AppendFuture = (*appendFuture)(nil)
 
 func (a *appendFuture) Start() time.Time {
 	return a.start

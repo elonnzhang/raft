@@ -80,6 +80,7 @@ func getSnapshotVersion(protocolVersion ProtocolVersion) SnapshotVersion {
 
 // commitTuple is used to send an index that was committed,
 // with an optional associated future that should be invoked.
+// 提交的元组数据：日志条目以及提交后结果
 type commitTuple struct {
 	log    *Log
 	future *logFuture
@@ -90,48 +91,56 @@ type leaderState struct {
 	leadershipTransferInProgress int32 // indicates that a leadership transfer is in progress.
 	commitCh                     chan struct{}
 	commitment                   *commitment
-	inflight                     *list.List // list of logFuture in log index order
-	replState                    map[ServerID]*followerReplication
+	inflight                     *list.List                        // list of logFuture in log index order // 双向链表
+	replState                    map[ServerID]*followerReplication // Follower 的复制状态
 	notify                       map[*verifyFuture]struct{}
 	stepDown                     chan struct{}
 }
 
 // setLeader is used to modify the current leader Address and ID of the cluster
+// 设置为 Leader 状态
 func (r *Raft) setLeader(leaderAddr ServerAddress, leaderID ServerID) {
+	// 加锁
 	r.leaderLock.Lock()
-	oldLeaderAddr := r.leaderAddr
-	r.leaderAddr = leaderAddr
-	oldLeaderID := r.leaderID
-	r.leaderID = leaderID
+	oldLeaderAddr := r.leaderAddr // 旧 地址
+	r.leaderAddr = leaderAddr     // 新 地址
+	oldLeaderID := r.leaderID     // 旧 ID
+	r.leaderID = leaderID         // 新 ID
+	// 解锁
 	r.leaderLock.Unlock()
+	// 给每个 Observer 着发送信息
 	if oldLeaderAddr != leaderAddr || oldLeaderID != leaderID {
 		r.observe(LeaderObservation{Leader: leaderAddr, LeaderAddr: leaderAddr, LeaderID: leaderID})
 	}
 }
 
-// requestConfigChange is a helper for the above functions that make
-// configuration change requests. 'req' describes the change. For timeout,
-// see AddVoter.
+// requestConfigChange is a helper for the above functions that make configuration change requests.
+// 'req' describes the change. For timeout, see AddVoter.
 func (r *Raft) requestConfigChange(req configurationChangeRequest, timeout time.Duration) IndexFuture {
+	// 设置超时
 	var timer <-chan time.Time
 	if timeout > 0 {
 		timer = time.After(timeout)
 	}
+	// 请求&结果初始化
 	future := &configurationChangeFuture{
 		req: req,
 	}
 	future.init()
+
+	// 监听信号
 	select {
-	case <-timer:
+	case <-timer: // 超时
 		return errorFuture{ErrEnqueueTimeout}
-	case r.configurationChangeCh <- future:
+	case r.configurationChangeCh <- future: // 配置变更
 		return future
-	case <-r.shutdownCh:
+	case <-r.shutdownCh: // 关闭
 		return errorFuture{ErrRaftShutdown}
 	}
 }
 
 // run the main thread that handles leadership and RPC requests.
+// ！！！！ 主要线程
 func (r *Raft) run() {
 	for {
 		// Check if we are doing a shutdown
@@ -142,7 +151,7 @@ func (r *Raft) run() {
 			return
 		default:
 		}
-
+		// 根据不同状态进行操作
 		switch r.getState() {
 		case Follower:
 			r.runFollower()
@@ -157,74 +166,82 @@ func (r *Raft) run() {
 // runFollower runs the main loop while in the follower state.
 func (r *Raft) runFollower() {
 	didWarn := false
+	// 获取 Leader 信息
 	leaderAddr, leaderID := r.LeaderWithID()
 	r.logger.Info("entering follower state", "follower", r, "leader-address", leaderAddr, "leader-id", leaderID)
 	metrics.IncrCounter([]string{"raft", "state", "follower"}, 1)
+	// 心跳定时器（随机时间）
 	heartbeatTimer := randomTimeout(r.config().HeartbeatTimeout)
 
+	// 确认状态进入
 	for r.getState() == Follower {
 		r.mainThreadSaturation.sleeping()
 
+		// 信号选择
 		select {
+		// rpc
 		case rpc := <-r.rpcCh:
 			r.mainThreadSaturation.working()
 			r.processRPC(rpc)
-
+		// configuration change
 		case c := <-r.configurationChangeCh:
 			r.mainThreadSaturation.working()
 			// Reject any operations since we are not the leader
 			c.respond(ErrNotLeader)
-
+		// apply 不能处理数据
 		case a := <-r.applyCh:
 			r.mainThreadSaturation.working()
 			// Reject any operations since we are not the leader
 			a.respond(ErrNotLeader)
-
+		// verify
 		case v := <-r.verifyCh:
 			r.mainThreadSaturation.working()
 			// Reject any operations since we are not the leader
 			v.respond(ErrNotLeader)
-
+		// user restore
 		case ur := <-r.userRestoreCh:
 			r.mainThreadSaturation.working()
 			// Reject any restores since we are not the leader
 			ur.respond(ErrNotLeader)
-
+		// leadership transfer
 		case l := <-r.leadershipTransferCh:
 			r.mainThreadSaturation.working()
 			// Reject any operations since we are not the leader
 			l.respond(ErrNotLeader)
-
+		// configuration
 		case c := <-r.configurationsCh:
 			r.mainThreadSaturation.working()
 			c.configurations = r.configurations.Clone()
 			c.respond(nil)
-
+		// bootstrap
 		case b := <-r.bootstrapCh:
 			r.mainThreadSaturation.working()
 			b.respond(r.liveBootstrap(b.configuration))
-
+		// leader nofity (又不是 Leader 没得干)
 		case <-r.leaderNotifyCh:
 			//  Ignore since we are not the leader
-
+		// follower notify
 		case <-r.followerNotifyCh:
 			heartbeatTimer = time.After(0)
 
+		// heartbeat timer
 		case <-heartbeatTimer:
 			r.mainThreadSaturation.working()
-			// Restart the heartbeat timer
+			// Restart the heartbeat timer （随机时间）
 			hbTimeout := r.config().HeartbeatTimeout
 			heartbeatTimer = randomTimeout(hbTimeout)
 
 			// Check if we have had a successful contact
 			lastContact := r.LastContact()
 			if time.Since(lastContact) < hbTimeout {
+				// 上次联系时间小于心跳上报时间
 				continue
 			}
 
+			// 心跳上报失败，准备进入候选者状态
 			// Heartbeat failed! Transition to the candidate state
 			lastLeaderAddr, lastLeaderID := r.LeaderWithID()
-			r.setLeader("", "")
+			r.setLeader("", "") // 清楚 Leader 信息
 
 			if r.configurations.latestIndex == 0 {
 				if !didWarn {
@@ -233,22 +250,27 @@ func (r *Raft) runFollower() {
 				}
 			} else if r.configurations.latestIndex == r.configurations.committedIndex &&
 				!hasVote(r.configurations.latest, r.localID) {
+				// 如果当前配置的 latestIndex 和 committedIndex 相等，
+				// 且当前节点*没有*投票给最新的配置，
+				// 表示当前节点不在稳定配置中，不能进行选举。
 				if !didWarn {
 					r.logger.Warn("not part of stable configuration, aborting election")
 					didWarn = true
 				}
 			} else {
+				// 准备开始选举
 				metrics.IncrCounter([]string{"raft", "transition", "heartbeat_timeout"}, 1)
+				// 检查是否有资格
 				if hasVote(r.configurations.latest, r.localID) {
 					r.logger.Warn("heartbeat timeout reached, starting election", "last-leader-addr", lastLeaderAddr, "last-leader-id", lastLeaderID)
-					r.setState(Candidate)
+					r.setState(Candidate) // 进入候选人状态
 					return
 				} else if !didWarn {
 					r.logger.Warn("heartbeat timeout reached, not part of a stable configuration or a non-voter, not triggering a leader election")
 					didWarn = true
 				}
 			}
-
+		// shutdown
 		case <-r.shutdownCh:
 			return
 		}
@@ -259,6 +281,7 @@ func (r *Raft) runFollower() {
 // the Raft object's member BootstrapCluster for more details. This must only be
 // called on the main thread, and only makes sense in the follower state.
 func (r *Raft) liveBootstrap(configuration Configuration) error {
+	// 无投票的
 	if !hasVote(configuration, r.localID) {
 		// Reject this operation since we are not a voter
 		return ErrNotVoter
@@ -273,6 +296,7 @@ func (r *Raft) liveBootstrap(configuration Configuration) error {
 
 	// Make the configuration live.
 	var entry Log
+	// 获取 1 号 日志条目
 	if err := r.logs.GetLog(1, &entry); err != nil {
 		panic(err)
 	}
@@ -452,9 +476,11 @@ func (r *Raft) getLeadershipTransferInProgress() bool {
 	return v == 1
 }
 
+// setupLeaderState 设置 Leader 状态 （初始化）
 func (r *Raft) setupLeaderState() {
 	r.leaderState.commitCh = make(chan struct{}, 1)
-	r.leaderState.commitment = newCommitment(r.leaderState.commitCh,
+	r.leaderState.commitment = newCommitment(
+		r.leaderState.commitCh,
 		r.configurations.latest,
 		r.getLastIndex()+1 /* first index that may be committed in this term */)
 	r.leaderState.inflight = list.New()
@@ -490,8 +516,7 @@ func (r *Raft) runLeader() {
 		}
 	}
 
-	// setup leader state. This is only supposed to be accessed within the
-	// leaderloop.
+	// setup leader state. This is only supposed to be accessed within the leaderloop.
 	r.setupLeaderState()
 
 	// Run a background go-routine to emit metrics on log age
@@ -664,6 +689,7 @@ func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {
 
 // leaderLoop is the hot loop for a leader. It is invoked
 // after all the various leader setup is done.
+// Leader 的工作职能: 监听事件
 func (r *Raft) leaderLoop() {
 	// stepDown is used to track if there is an inflight log that
 	// would cause us to lose leadership (specifically a RemovePeer of
@@ -674,20 +700,24 @@ func (r *Raft) leaderLoop() {
 	stepDown := false
 	// This is only used for the first lease check, we reload lease below
 	// based on the current config value.
+	// 租约释放
 	lease := time.After(r.config().LeaderLeaseTimeout)
 
 	for r.getState() == Leader {
 		r.mainThreadSaturation.sleeping()
 
 		select {
+		// 持续处理 RPC
 		case rpc := <-r.rpcCh:
 			r.mainThreadSaturation.working()
 			r.processRPC(rpc)
 
+		// 退位了
 		case <-r.leaderState.stepDown:
 			r.mainThreadSaturation.working()
 			r.setState(Follower)
 
+		// 领导权移交
 		case future := <-r.leadershipTransferCh:
 			r.mainThreadSaturation.working()
 			if r.getLeadershipTransferInProgress() {
@@ -782,6 +812,7 @@ func (r *Raft) leaderLoop() {
 			r.setLeadershipTransferInProgress(true)
 			go r.leadershipTransfer(*id, *address, state, stopCh, doneCh)
 
+		// 提交
 		case <-r.leaderState.commitCh:
 			r.mainThreadSaturation.working()
 			// Process the newly committed entries
@@ -845,12 +876,14 @@ func (r *Raft) leaderLoop() {
 				}
 			}
 
+		// 验证领导权
 		case v := <-r.verifyCh:
 			r.mainThreadSaturation.working()
 			if v.quorumSize == 0 {
 				// Just dispatched, start the verification
 				r.verifyLeader(v)
 			} else if v.votes < v.quorumSize {
+				// 票数不足法定数量，退位重新选举。
 				// Early return, means there must be a new leader
 				r.logger.Warn("new leader elected, stepping down")
 				r.setState(Follower)
@@ -862,6 +895,7 @@ func (r *Raft) leaderLoop() {
 
 			} else {
 				// Quorum of members agree, we are still leader
+				// 多数同意 🙆‍♀️，还是 Leader
 				delete(r.leaderState.notify, v)
 				for _, repl := range r.leaderState.replState {
 					repl.cleanNotify(v)
@@ -869,6 +903,7 @@ func (r *Raft) leaderLoop() {
 				v.respond(nil)
 			}
 
+		// 恢复
 		case future := <-r.userRestoreCh:
 			r.mainThreadSaturation.working()
 			if r.getLeadershipTransferInProgress() {
@@ -879,6 +914,7 @@ func (r *Raft) leaderLoop() {
 			err := r.restoreUserSnapshot(future.meta, future.reader)
 			future.respond(err)
 
+		// 配置
 		case future := <-r.configurationsCh:
 			r.mainThreadSaturation.working()
 			if r.getLeadershipTransferInProgress() {
@@ -889,6 +925,7 @@ func (r *Raft) leaderLoop() {
 			future.configurations = r.configurations.Clone()
 			future.respond(nil)
 
+		// 配置变更
 		case future := <-r.configurationChangeChIfStable():
 			r.mainThreadSaturation.working()
 			if r.getLeadershipTransferInProgress() {
@@ -898,10 +935,12 @@ func (r *Raft) leaderLoop() {
 			}
 			r.appendConfigurationEntry(future)
 
+		// 启动 （启动都是 Follower，所以这里是错误响应）
 		case b := <-r.bootstrapCh:
 			r.mainThreadSaturation.working()
 			b.respond(ErrCantBootstrap)
 
+		// apply Log
 		case newLog := <-r.applyCh:
 			r.mainThreadSaturation.working()
 			if r.getLeadershipTransferInProgress() {
@@ -910,8 +949,10 @@ func (r *Raft) leaderLoop() {
 				continue
 			}
 			// Group commit, gather all the ready commits
+			// 日志的批量提交
 			ready := []*logFuture{newLog}
 		GROUP_COMMIT_LOOP:
+			// 尝试凑齐 MaxAppendEntries 数量的日志
 			for i := 0; i < r.config().MaxAppendEntries; i++ {
 				select {
 				case newLog := <-r.applyCh:
@@ -923,11 +964,14 @@ func (r *Raft) leaderLoop() {
 
 			// Dispatch the logs
 			if stepDown {
+				// 退位：不处理新的请求
 				// we're in the process of stepping down as leader, don't process anything new
 				for i := range ready {
 					ready[i].respond(ErrNotLeader)
 				}
 			} else {
+				// 正常：
+				// 分发日志
 				r.dispatchLogs(ready)
 			}
 
@@ -945,15 +989,17 @@ func (r *Raft) leaderLoop() {
 
 			// Renew the lease timer
 			lease = time.After(checkInterval)
-
+		// leader 通知
 		case <-r.leaderNotifyCh:
 			for _, repl := range r.leaderState.replState {
 				asyncNotifyCh(repl.notifyCh)
 			}
 
+		// Follower 通知
 		case <-r.followerNotifyCh:
 			//  Ignore since we are not a follower
 
+		// 关闭
 		case <-r.shutdownCh:
 			return
 		}
@@ -977,7 +1023,7 @@ func (r *Raft) verifyLeader(v *verifyFuture) {
 	v.notifyCh = r.verifyCh
 	r.leaderState.notify[v] = struct{}{}
 
-	// Trigger immediate heartbeats
+	// Trigger immediate heartbeats 出发心跳
 	for _, repl := range r.leaderState.replState {
 		repl.notifyLock.Lock()
 		repl.notify[v] = struct{}{}
@@ -1200,7 +1246,9 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 // appendConfigurationEntry changes the configuration and adds a new
 // configuration entry to the log. This must only be called from the
 // main thread.
+// 增加 configuration 日志条目 （只能被主线程调用）
 func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
+	// 生成
 	configuration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)
 	if err != nil {
 		future.respond(err)
@@ -1241,20 +1289,23 @@ func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
 
 // dispatchLog is called on the leader to push a log to disk, mark it
 // as inflight and begin replication of it.
+// 分发日志
 func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	now := time.Now()
 	defer metrics.MeasureSince([]string{"raft", "leader", "dispatchLog"}, now)
 
+	// 任期以及位置
 	term := r.getCurrentTerm()
 	lastIndex := r.getLastIndex()
 
-	n := len(applyLogs)
-	logs := make([]*Log, n)
+	n := len(applyLogs)     // 需要分发的日志条目
+	logs := make([]*Log, n) // 本地写的
 	metrics.SetGauge([]string{"raft", "leader", "dispatchNumLogs"}, float32(n))
 
+	// 遍历
 	for idx, applyLog := range applyLogs {
 		applyLog.dispatch = now
-		lastIndex++
+		lastIndex++ //  对遍历的日志 index +1 （全局单调递增）
 		applyLog.log.Index = lastIndex
 		applyLog.log.Term = term
 		applyLog.log.AppendedAt = now
@@ -1263,20 +1314,27 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	}
 
 	// Write the log entry locally
+	// 写本地
 	if err := r.logs.StoreLogs(logs); err != nil {
+		// 写失败
 		r.logger.Error("failed to commit logs", "error", err)
 		for _, applyLog := range applyLogs {
+			// 遍历写响应 返回错误
 			applyLog.respond(err)
 		}
+		// 退为 Follower 状态
 		r.setState(Follower)
 		return
 	}
+	// 计算 matchIndex
 	r.leaderState.commitment.match(r.localID, lastIndex)
 
 	// Update the last log since it's on disk now
+	// 记录当前的日志的信息.
 	r.setLastLog(lastIndex, term)
 
 	// Notify the replicators of the new log
+	// 把请求的日志通知给所有的 replication 同步副本.
 	for _, f := range r.leaderState.replState {
 		asyncNotifyCh(f.triggerCh)
 	}
@@ -1289,6 +1347,7 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 // pass futures=nil.
 // Leaders call this when entries are committed. They pass the futures from any
 // inflight logs.
+// 处理日志条目
 func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	// Reject logs we've applied already
 	lastApplied := r.getLastApplied()
@@ -1313,6 +1372,7 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	// need to use the same value for all lines here to get the expected result.
 	maxAppendEntries := r.config().MaxAppendEntries
 
+	// 初始化批处理数据
 	batch := make([]*commitTuple, 0, maxAppendEntries)
 
 	// Apply all the preceding logs
@@ -1323,7 +1383,9 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 		if futureOk {
 			preparedLog = r.prepareLog(&future.log, future)
 		} else {
+			// 初始化 Log 日志条目
 			l := new(Log)
+			// 根据 index 取
 			if err := r.logs.GetLog(idx, l); err != nil {
 				r.logger.Error("failed to get log", "index", idx, "error", err)
 				panic(err)
@@ -1335,11 +1397,14 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 		case preparedLog != nil:
 			// If we have a log ready to send to the FSM add it to the batch.
 			// The FSM thread will respond to the future.
+			// 增加到批处理数据中
 			batch = append(batch, preparedLog)
 
 			// If we have filled up a batch, send it to the FSM
+			// 如果 达到了最大 Append 的限制，发送给 FSM 处理
 			if len(batch) >= maxAppendEntries {
 				applyBatch(batch)
+				// 重新初始化
 				batch = make([]*commitTuple, 0, maxAppendEntries)
 			}
 
@@ -1350,15 +1415,18 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	}
 
 	// If there are any remaining logs in the batch apply them
+	// 还有剩余，继续 apply 收尾动作
 	if len(batch) != 0 {
 		applyBatch(batch)
 	}
 
 	// Update the lastApplied index and term
+	// 更新最后的 apply log 的 index
 	r.setLastApplied(index)
 }
 
 // processLog is invoked to process the application of a single committed log entry.
+// 准备工作：LogCommand LogConfiguration 增加 future
 func (r *Raft) prepareLog(l *Log, future *logFuture) *commitTuple {
 	switch l.Type {
 	case LogBarrier:
@@ -1394,14 +1462,19 @@ func (r *Raft) processRPC(rpc RPC) {
 	}
 
 	switch cmd := rpc.Command.(type) {
+	// 追加日志条目
 	case *AppendEntriesRequest:
 		r.appendEntries(rpc, cmd)
+	// 请求投票
 	case *RequestVoteRequest:
 		r.requestVote(rpc, cmd)
+	// 请求预投票
 	case *RequestPreVoteRequest:
 		r.requestPreVote(rpc, cmd)
+	// 安装快照
 	case *InstallSnapshotRequest:
 		r.installSnapshot(rpc, cmd)
+	// 超时
 	case *TimeoutNowRequest:
 		r.timeoutNow(rpc, cmd)
 	default:
@@ -1453,20 +1526,24 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	}()
 
 	// Ignore an older term
+	// 抛弃任期小于当前任期的请求
 	if a.Term < r.getCurrentTerm() {
 		return
 	}
 
 	// Increase the term if we see a newer one, also transition to follower
 	// if we ever get an appendEntries call
+	// 如果任期大于(＞)当前任期，或者 不是追随者的同时也不在领导者转移权利期间
 	if a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {
 		// Ensure transition to follower
+		// 进入追随者
 		r.setState(Follower)
 		r.setCurrentTerm(a.Term)
 		resp.Term = a.Term
 	}
 
 	// Save the current leader
+	// 保存 当前的 Leader 信息
 	if len(a.Addr) > 0 {
 		r.setLeader(r.trans.DecodePeer(a.Addr), ServerID(a.ID))
 	} else {

@@ -60,6 +60,7 @@ type followerReplication struct {
 	stopCh chan uint64
 
 	// triggerCh is notified every time new entries are appended to the log.
+	// 新的日志条目被追加后的通知
 	triggerCh chan struct{}
 
 	// triggerDeferErrorCh is used to provide a backchannel. By sending a
@@ -77,8 +78,8 @@ type followerReplication struct {
 	// used to apply backoff.
 	failures uint64
 
-	// notifyCh is notified to send out a heartbeat, which is used to check that
-	// this server is still leader.
+	// notifyCh is notified to send out a heartbeat, which is used to check that this server is still leader.
+	// 用于验证是否为 Leader
 	notifyCh chan struct{}
 	// notify is a map of futures to be resolved upon receipt of an
 	// acknowledgement, then cleared from this map.
@@ -136,6 +137,7 @@ func (s *followerReplication) setLastContact() {
 // follower.
 func (r *Raft) replicate(s *followerReplication) {
 	// Start an async heartbeating routing
+	// 异步心跳
 	stopHeartbeat := make(chan struct{})
 	defer close(stopHeartbeat)
 	r.goFunc(func() { r.heartbeat(s, stopHeartbeat) })
@@ -144,8 +146,10 @@ RPC:
 	shouldStop := false
 	for !shouldStop {
 		select {
+		// 当收到退出时, 尝试把未同步的日志推到 follower 端.
 		case maxIndex := <-s.stopCh:
 			// Make a best effort to replicate up to this index
+			// 尽最大能力同步
 			if maxIndex > 0 {
 				r.replicateTo(s, maxIndex)
 			}
@@ -158,8 +162,11 @@ RPC:
 			} else {
 				deferErr.respond(fmt.Errorf("replication failed"))
 			}
+		// 接受到新条目增加
 		case <-s.triggerCh:
+			// 获取最新
 			lastLogIdx, _ := r.getLastLog()
+			// 同步
 			shouldStop = r.replicateTo(s, lastLogIdx)
 		// This is _not_ our heartbeat mechanism but is to ensure
 		// followers quickly learn the leader's commit index when
@@ -172,6 +179,7 @@ RPC:
 		}
 
 		// If things looks healthy, switch to pipeline mode
+		// 同步成功后，允许 PIPELINE
 		if !shouldStop && s.allowPipeline {
 			goto PIPELINE
 		}
@@ -180,6 +188,7 @@ RPC:
 
 PIPELINE:
 	// Disable until re-enabled
+	// 进入后关闭
 	s.allowPipeline = false
 
 	// Replicates using a pipeline for high performance. This method
@@ -193,12 +202,14 @@ PIPELINE:
 			r.logger.Error("failed to start pipeline replication to", "peer", peer, "error", err)
 		}
 	}
+	// 回到 RPC
 	goto RPC
 }
 
 // replicateTo is a helper to replicate(), used to replicate the logs up to a
 // given last index.
 // If the follower log is behind, we take care to bring them up to date.
+// 同步核心逻辑
 func (r *Raft) replicateTo(s *followerReplication, lastIndex uint64) (shouldStop bool) {
 	// Create the base request
 	var req AppendEntriesRequest
@@ -208,6 +219,7 @@ func (r *Raft) replicateTo(s *followerReplication, lastIndex uint64) (shouldStop
 
 START:
 	// Prevent an excessive retry rate on errors
+	// 防止过多的 retry, 每次失败需要等待更多的退避时间.
 	if s.failures > 0 {
 		select {
 		case <-time.After(backoff(failureWait, s.failures, maxFailureScale)):
@@ -220,36 +232,45 @@ START:
 	s.peerLock.RUnlock()
 
 	// Setup the request
+	// 把需要同步给 follower 的日志装载到 req 对象中.
 	if err := r.setupAppendEntries(s, &req, atomic.LoadUint64(&s.nextIndex), lastIndex); err == ErrLogNotFound {
+		// 如果 log index 已经不存在, 则发送基础数据的快照.
 		goto SEND_SNAP
 	} else if err != nil {
 		return
 	}
 
 	// Make the RPC call
+	// 发送请求
 	start = time.Now()
 	if err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
 		r.logger.Error("failed to appendEntries to", "peer", peer, "error", err)
+		// 失败++
 		s.failures++
 		return
 	}
 	appendStats(string(peer.ID), start, float32(len(req.Entries)), r.noLegacyTelemetry)
 
 	// Check for a newer term, stop running
+	// 如果发现更新的 term 任期, 则退出.
 	if resp.Term > req.Term {
 		r.handleStaleTerm(s)
 		return true
 	}
 
 	// Update the last contact
+	// 更新跟 Follower 的联系时间
 	s.setLastContact()
 
+	// 响应结果处理
 	// Update s based on success
-	if resp.Success {
+	if resp.Success { // 成功
 		// Update our replication state
+		// 更新复制状态
 		updateLastAppended(s, &req)
 
 		// Clear any failures, allow pipelining
+		// 清空重置
 		s.failures = 0
 		s.allowPipeline = true
 	} else {
@@ -283,6 +304,7 @@ CHECK_MORE:
 	// SEND_SNAP is used when we fail to get a log, usually because the follower
 	// is too far behind, and we must ship a snapshot down instead
 SEND_SNAP:
+	// 发送最新快照
 	if stop, err := r.sendLatestSnapshot(s); stop {
 		return true
 	} else if err != nil {
@@ -291,6 +313,7 @@ SEND_SNAP:
 	}
 
 	// Check if there is more to replicate
+	// 跳到 check_more, 检查是否有增量日志更新.
 	goto CHECK_MORE
 }
 
@@ -565,15 +588,19 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 }
 
 // setupAppendEntries is used to setup an append entries request.
+// 构造
 func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequest, nextIndex, lastIndex uint64) error {
 	req.RPCHeader = r.getRPCHeader()
 	req.Term = s.currentTerm
 	// this is needed for retro compatibility, before RPCHeader.Addr was added
+	// 容错
 	req.Leader = r.trans.EncodePeer(r.localID, r.localAddr)
 	req.LeaderCommitIndex = r.getCommitIndex()
+	// 获取 nextIndex 前的 Log 信息
 	if err := r.setPreviousLog(req, nextIndex); err != nil {
 		return err
 	}
+	// 写入增量 Log 数据
 	if err := r.setNewLogs(req, nextIndex, lastIndex); err != nil {
 		return err
 	}
@@ -587,15 +614,18 @@ func (r *Raft) setPreviousLog(req *AppendEntriesRequest, nextIndex uint64) error
 	// Guard against the previous index being a snapshot as well
 	lastSnapIdx, lastSnapTerm := r.getLastSnapshot()
 	if nextIndex == 1 {
+		// 如果 nextIndex 等于 1, 那么 prev 必然为 0.
 		req.PrevLogEntry = 0
 		req.PrevLogTerm = 0
 
 	} else if (nextIndex - 1) == lastSnapIdx {
+		// 如果 nextIndex-1 等于 快照数据的最大 index, 则 prev 使用快照的值.
 		req.PrevLogEntry = lastSnapIdx
 		req.PrevLogTerm = lastSnapTerm
 
 	} else {
 		var l Log
+		// 从 LogStore 存储获取上一条日志数据.
 		if err := r.logs.GetLog(nextIndex-1, &l); err != nil {
 			r.logger.Error("failed to get log", "index", nextIndex-1, "error", err)
 			return err
@@ -613,8 +643,9 @@ func (r *Raft) setNewLogs(req *AppendEntriesRequest, nextIndex, lastIndex uint64
 	// Append up to MaxAppendEntries or up to the lastIndex. we need to use a
 	// consistent value for maxAppendEntries in the lines below in case it ever
 	// becomes reloadable.
+	// 为避免一次传递太多的数据, 这里限定单次不能超过 MaxAppendEntries 条日志.
 	maxAppendEntries := r.config().MaxAppendEntries
-	req.Entries = make([]*Log, 0, maxAppendEntries)
+	req.Entries = make([]*Log, 0, maxAppendEntries) // 初始化最大容量
 	maxIndex := min(nextIndex+uint64(maxAppendEntries)-1, lastIndex)
 	for i := nextIndex; i <= maxIndex; i++ {
 		oldLog := new(Log)

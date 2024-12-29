@@ -10,6 +10,7 @@ import (
 
 // RaftState captures the state of a Raft node: Follower, Candidate, Leader,
 // or Shutdown.
+// Raft 状态
 type RaftState uint32
 
 const (
@@ -44,6 +45,7 @@ func (s RaftState) String() string {
 // raftState is used to maintain various state variables
 // and provides an interface to set/get the variables in a
 // thread safe manner.
+// raft 状态变量 (线程安全)
 type raftState struct {
 	// currentTerm commitIndex, lastApplied,  must be kept at the top of
 	// the struct so they're 64 bit aligned which is a requirement for
@@ -73,6 +75,7 @@ type raftState struct {
 	routinesGroup sync.WaitGroup
 
 	// The current state
+	// 角色
 	state RaftState
 }
 

@@ -6,6 +6,7 @@ package raft
 import "fmt"
 
 // ServerSuffrage determines whether a Server in a Configuration gets a vote.
+// 选举权
 type ServerSuffrage int
 
 // Note: Don't renumber these, since the numbers are written into the log.
@@ -62,9 +63,10 @@ type ServerID string
 type ServerAddress string
 
 // Server tracks the information about a single server in a configuration.
+// 服务节点状态
 type Server struct {
 	// Suffrage determines whether the server gets a vote.
-	Suffrage ServerSuffrage
+	Suffrage ServerSuffrage // 选举权
 	// ID is a unique string identifying this server for all time.
 	ID ServerID
 	// Address is its network address that a transport can contact.
@@ -75,8 +77,9 @@ type Server struct {
 // votes. This should include the local server, if it's a member of the cluster.
 // The servers are listed no particular order, but each should only appear once.
 // These entries are appended to the log during membership changes.
+// 集群服务成员状态
 type Configuration struct {
-	Servers []Server
+	Servers []Server // 服务节点列表
 }
 
 // Clone makes a deep copy of a Configuration.
@@ -85,8 +88,8 @@ func (c *Configuration) Clone() (copy Configuration) {
 	return
 }
 
-// ConfigurationChangeCommand is the different ways to change the cluster
-// configuration.
+// ConfigurationChangeCommand is the different ways to change the cluster configuration.
+// 配置变更命令
 type ConfigurationChangeCommand uint8
 
 const (
@@ -150,11 +153,13 @@ type configurationChangeRequest struct {
 type configurations struct {
 	// committed is the latest configuration in the log/snapshot that has been
 	// committed (the one with the largest index).
+	// 提交的最新的配置
 	committed Configuration
 	// committedIndex is the log index where 'committed' was written.
 	committedIndex uint64
 	// latest is the latest configuration in the log/snapshot (may be committed
 	// or uncommitted)
+	// 最新的配置（可能是提交的也可能是未提交的）
 	latest Configuration
 	// latestIndex is the log index where 'latest' was written.
 	latestIndex uint64
@@ -174,6 +179,7 @@ func (c *configurations) Clone() (copy configurations) {
 func hasVote(configuration Configuration, id ServerID) bool {
 	for _, server := range configuration.Servers {
 		if server.ID == id {
+			// 是否为选民（可以投票）
 			return server.Suffrage == Voter
 		}
 	}
@@ -191,8 +197,8 @@ func inConfiguration(configuration Configuration, id ServerID) bool {
 	return false
 }
 
-// checkConfiguration tests a cluster membership configuration for common
-// errors.
+// checkConfiguration tests a cluster membership configuration for common errors.
+// 检查集群配置，id、address 有效且不重复
 func checkConfiguration(configuration Configuration) error {
 	idSet := make(map[ServerID]bool)
 	addressSet := make(map[ServerAddress]bool)

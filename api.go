@@ -77,7 +77,7 @@ var (
 
 // Raft implements a Raft node.
 type Raft struct {
-	raftState
+	raftState // raft 状态变量
 
 	// protocolVersion is used to inter-operate with Raft servers running
 	// different versions of the library. See comments in config.go for more
@@ -88,9 +88,8 @@ type Raft struct {
 	// be committed and applied to the FSM.
 	applyCh chan *logFuture
 
-	// conf stores the current configuration to use. This is the most recent one
-	// provided. All reads of config values should use the config() helper method
-	// to read this safely.
+	// conf stores the current configuration to use. This is the most recent one provided.
+	// All reads of config values should use the config() helper method to read this safely.
 	conf atomic.Value
 
 	// confReloadMu ensures that only one thread can reload config at once since
@@ -134,6 +133,7 @@ type Raft struct {
 	// candidate because the leader tries to transfer leadership. This flag is
 	// used in RequestVoteRequest to express that a leadership transfer is going
 	// on.
+	// 领导者转移领导权利
 	candidateFromLeadershipTransfer atomic.Bool
 
 	// Stores our local server ID, used to avoid sending RPCs to ourself
@@ -212,6 +212,8 @@ type Raft struct {
 	followerNotifyCh chan struct{}
 
 	// mainThreadSaturation measures the saturation of the main raft goroutine.
+	// 是一个指标，用于评估主 Raft 协程的负载情况，即它是否接近其处理能力的上限。
+	// 在 Raft 实现中，主协程通常负责处理关键任务，如日志复制、心跳管理和状态转换。监控其饱和度可以帮助优化系统性能，发现潜在的瓶颈。
 	mainThreadSaturation *saturationMetric
 
 	// preVoteDisabled control if the pre-vote feature is activated,
@@ -236,8 +238,13 @@ type Raft struct {
 // One approach is to bootstrap a single server with a configuration
 // listing just itself as a Voter, then invoke AddVoter() on it to add other
 // servers to the cluster.
-func BootstrapCluster(conf *Config, logs LogStore, stable StableStore,
-	snaps SnapshotStore, trans Transport, configuration Configuration,
+func BootstrapCluster(
+	conf *Config, //                 配置
+	logs LogStore, //               日志存储
+	stable StableStore, //          元数据存储
+	snaps SnapshotStore, //         快照存储
+	trans Transport, //             通信
+	configuration Configuration, // 集群配置
 ) error {
 	// Validate the Raft server config.
 	if err := ValidateConfig(conf); err != nil {
@@ -816,6 +823,7 @@ func (r *Raft) LeaderWithID() (ServerAddress, ServerID) {
 // If a user snapshot is restored while the command is in-flight, an
 // ErrAbortedByRestore is returned. In this case the write effectively failed
 // since its effects will not be present in the FSM after the restore.
+// 写数据，包装成 Log 在写日志
 func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyFuture {
 	return r.ApplyLog(Log{Data: cmd}, timeout)
 }
@@ -823,30 +831,34 @@ func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyFuture {
 // ApplyLog performs Apply but takes in a Log directly. The only values
 // currently taken from the submitted Log are Data and Extensions. See
 // Apply for details on error cases.
+// 写日志
 func (r *Raft) ApplyLog(log Log, timeout time.Duration) ApplyFuture {
 	metrics.IncrCounter([]string{"raft", "apply"}, 1)
 
+	// 超时推到 applyCh 的超时设置
 	var timer <-chan time.Time
 	if timeout > 0 {
 		timer = time.After(timeout)
 	}
 
 	// Create a log future, no index or term yet
+	// 包装
 	logFuture := &logFuture{
 		log: Log{
-			Type:       LogCommand,
-			Data:       log.Data,
-			Extensions: log.Extensions,
+			Type:       LogCommand,     // 业务日志
+			Data:       log.Data,       // 业务数据
+			Extensions: log.Extensions, // 扩展 （这里为空）
 		},
 	}
+	// deferError errCh 初始化, 业务层可通过 Error() 监听其输出.
 	logFuture.init()
 
 	select {
-	case <-timer:
+	case <-timer: // 超时
 		return errorFuture{ErrEnqueueTimeout}
-	case <-r.shutdownCh:
+	case <-r.shutdownCh: // 关闭
 		return errorFuture{ErrRaftShutdown}
-	case r.applyCh <- logFuture:
+	case r.applyCh <- logFuture: // 入队列
 		return logFuture
 	}
 }

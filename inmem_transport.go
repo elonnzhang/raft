@@ -46,6 +46,8 @@ type InmemTransport struct {
 	timeout    time.Duration
 }
 
+var _ Transport = (*InmemTransport)(nil)
+
 // NewInmemTransportWithTimeout is used to initialize a new transport and
 // generates a random local address if none is specified. The given timeout
 // will be used to decide how long to wait for a connected peer to process the

@@ -34,6 +34,7 @@ type AppendEntriesRequest struct {
 	Leader []byte
 
 	// Provide the previous entries for integrity checking
+	// 前一条 Log 值的 index 和 term, Follower 会利用这两个值校验缺失和冲突.
 	PrevLogEntry uint64
 	PrevLogTerm  uint64
 

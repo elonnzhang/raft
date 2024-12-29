@@ -13,6 +13,7 @@ import (
 // the recently written entries. For implementations that do not
 // cache themselves, this can provide a substantial boost by
 // avoiding disk I/O on recent entries.
+// 包装了 LogStore
 type LogCache struct {
 	store LogStore
 

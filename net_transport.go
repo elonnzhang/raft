@@ -112,6 +112,8 @@ type NetworkTransport struct {
 	msgpackUseNewTimeFormat bool
 }
 
+var _ Transport = (*NetworkTransport)(nil)
+
 // NetworkTransportConfig encapsulates configuration for the network transport layer.
 type NetworkTransportConfig struct {
 	// ServerAddressProvider is used to override the target address when establishing a connection to invoke an RPC
